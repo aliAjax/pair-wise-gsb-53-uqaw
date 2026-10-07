@@ -12,6 +12,7 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+BATCH_RE = re.compile(r"^/api/batches/([A-Za-z0-9_\-\.]+)$")
 
 
 def make_handler(service: Any, static_dir: Path):
@@ -57,7 +58,9 @@ def make_handler(service: Any, static_dir: Path):
 
         def _handle_error(self, exc: Exception) -> None:
             if isinstance(exc, DomainError):
-                self._send(exc.status, {"error": exc.code, "message": str(exc)})
+                payload = {"error": exc.code, "message": str(exc)}
+                payload.update(getattr(exc, "extra", {}) or {})
+                self._send(exc.status, payload)
             else:
                 self._send(500, {"error": "internal_error", "message": "服务内部错误"})
 
@@ -87,6 +90,18 @@ def make_handler(service: Any, static_dir: Path):
                 if parsed.path == "/api/stats":
                     self._send(200, service.stats(self._actor()))
                     return
+                if parsed.path == "/api/batches":
+                    query = parse_qs(parsed.query)
+                    self._send(200, {"items": service.list_batches(self._actor(), limit=int(query.get("limit", ["100"])[0]))})
+                    return
+                match = BATCH_RE.match(parsed.path)
+                if match:
+                    self._send(200, service.get_batch(self._actor(), match.group(1)))
+                    return
+                quota_match = re.compile(r"^/api/quota/(-?\d+)$").match(parsed.path)
+                if quota_match:
+                    self._send(200, service.quota_status(self._actor(), int(quota_match.group(1))))
+                    return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:
                 self._handle_error(exc)
@@ -98,6 +113,24 @@ def make_handler(service: Any, static_dir: Path):
                 if parsed.path == "/api/records":
                     record = service.create(self._actor(), body.get("reference", ""), body.get("data", {}))
                     self._send(201, record)
+                    return
+                if parsed.path == "/api/batches":
+                    batch = service.create_batch(self._actor(), body.get("batch_no", ""), body.get("data", {}))
+                    self._send(201, batch)
+                    return
+                save_match = re.compile(r"^/api/batches/([A-Za-z0-9_\-\.]+)/saves$").match(parsed.path)
+                if save_match:
+                    version = body.get("expected_version")
+                    if not isinstance(version, int):
+                        raise ValidationError("expected_version必须是整数")
+                    result = service.save_batch(
+                        self._actor(), save_match.group(1), version,
+                        body.get("save_id", ""), body.get("data", {}),
+                    )
+                    self._send(200, result)
+                    return
+                if parsed.path == "/api/admin/backfill":
+                    self._send(200, service.backfill(self._actor()))
                     return
                 match = ACTION_RE.match(parsed.path)
                 if match:

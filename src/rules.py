@@ -1,5 +1,5 @@
 """移民案件期限与材料管理领域规则与状态转换。"""
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, text, text_list
 
@@ -9,6 +9,27 @@ CREATE_ROLES = {'intake_officer'}
 ACTION_ROLES = {'submit': {'legal_rep', 'case_officer'}, 'request_evidence': {'case_officer'}, 'respond': {'legal_rep'}, 'decide': {'case_officer', 'supervisor'}, 'appeal': {'legal_rep'}, 'close': {'supervisor'}}
 TRANSITIONS = {'submit': {'draft': 'submitted'}, 'request_evidence': {'submitted': 'evidence_requested'}, 'respond': {'evidence_requested': 'response_received'}, 'decide': {'submitted': 'decided', 'response_received': 'decided'}, 'appeal': {'decided': 'appealed'}, 'close': {'decided': 'closed', 'appealed': 'closed'}}
 
+# 联合申请批次相关状态
+REVIEW_STATE = "review"                       # 主案事实变化后，已决定案件保留原依据进入复核
+PENDING_VERIFICATION_STATE = "pending_verification"  # 历史数据补不全，停在待核
+# 主案事实变化时需要立刻失效重算的待办状态
+PENDING_STATES = {"draft", "submitted", "evidence_requested", "response_received"}
+# 已决定、不受自动重算影响、转入复核的状态
+DECIDED_STATES = {"decided", "appealed"}
+# 冻结状态：归档与待核不参与级联
+FROZEN_STATES = {"closed", PENDING_VERIFICATION_STATE, REVIEW_STATE}
+# 主案事实字段：变化即触发附属案级联
+PRIMARY_FACT_FIELDS = (
+    "applicant_id", "case_type", "received_day", "deadline_days",
+    "representation_active", "required_documents", "guarantor_id",
+)
+# 主案变化后需要同步到附属案的共享事实（申请人/案件类型仍以分申请人建档为准）
+SHARED_FACT_FIELDS = (
+    "received_day", "deadline_days", "representation_active",
+    "required_documents", "guarantor_id",
+)
+BATCH_ROLES = {'intake_officer', 'case_officer', 'supervisor', 'legal_rep'}
+
 
 class DomainRules:
     INITIAL_STATE = INITIAL_STATE
@@ -17,7 +38,10 @@ class DomainRules:
         all_roles = set(CREATE_ROLES)
         for roles in ACTION_ROLES.values():
             all_roles.update(roles)
-        return role == "admin" or role in all_roles
+        return role == "admin" or role in all_roles or role in BATCH_ROLES
+
+    def role_can_batch(self, role: str) -> bool:
+        return role == "admin" or role in BATCH_ROLES
 
     def role_can_create(self, role: str) -> bool:
         return role == "admin" or role in CREATE_ROLES
@@ -103,3 +127,110 @@ class DomainRules:
             summary = "案件归档"
         p.update(changes)
         return new_state, p, summary or ("已执行%s" % action)
+
+    # ------------------------------------------------------------------
+    # 联合申请批次
+    # ------------------------------------------------------------------
+    def validate_batch_create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        p = dict(payload or {})
+        text(p, "application_id")
+        p["quota_per_day"] = integer(p, "quota_per_day", 1) if "quota_per_day" in p else 50
+        return p
+
+    def validate_member(self, member: Dict[str, Any]) -> Dict[str, Any]:
+        m = dict(member or {})
+        m["role"] = choice(m, "role", ["primary", "dependent"])
+        role = m.pop("role")
+        prepared = self.prepare_create(m)
+        prepared["applicant_role"] = role
+        return prepared
+
+    @staticmethod
+    def diff_payload(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+        """只返回实际发生变化的字段。"""
+        changed: Dict[str, Any] = {}
+        for key, value in new.items():
+            if old.get(key) != value:
+                changed[key] = value
+        return changed
+
+    def primary_fact_changes(self, old_primary: Dict[str, Any], new_primary: Dict[str, Any]) -> Dict[str, Any]:
+        changed = self.diff_payload(old_primary, new_primary)
+        return {key: changed[key] for key in PRIMARY_FACT_FIELDS if key in changed}
+
+    def build_member_payload(self, existing: Dict[str, Any], incoming: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """合并批次成员材料，返回新payload与差异字段。"""
+        payload = dict(existing)
+        changed: Dict[str, Any] = {}
+        for key, value in incoming.items():
+            if payload.get(key) != value:
+                payload[key] = value
+                changed[key] = value
+        if changed:
+            payload["missing_documents"] = [
+                doc for doc in payload.get("required_documents", [])
+                if doc not in payload.get("submitted_documents", [])
+            ]
+        return payload, changed
+
+    def apply_primary_fact_change(self, member: Dict[str, Any], fact: Dict[str, Any], from_version: int, reason: str) -> Dict[str, Any]:
+        """主案事实更新后对单个附属成员的级联结果。
+
+        - 待办案件：原依据立刻失效并按新事实重算；
+        - 已决定案件：保留原依据快照，进入复核；
+        - 归档/待核/已复核案件：冻结，不做处理。
+        """
+        state = member["state"]
+        payload = dict(member["payload"])
+        result: Dict[str, Any] = {"member_id": member["id"], "action": "unchanged"}
+        if state in FROZEN_STATES:
+            return result
+        if state in DECIDED_STATES:
+            payload["basis_snapshot"] = {
+                "state": state,
+                "payload": dict(member["payload"]),
+                "basis_batch_version": from_version,
+            }
+            payload["review_reason"] = reason
+            result.update(action="enter_review", state=REVIEW_STATE, payload=payload)
+            return result
+        if state in PENDING_STATES:
+            stale = {key: value for key, value in fact.items() if key in SHARED_FACT_FIELDS}
+            # 原待办依据失效，随后按新事实重算
+            invalidated = dict(payload)
+            invalidated["invalidated_basis_batch_version"] = from_version
+            invalidated["invalidated_reason"] = reason
+            recalculated = self._recompute_facts(invalidated, stale)
+            recalculated["basis_batch_version"] = None  # 由仓储层在落盘时写入新版本
+            result.update(action="recompute", state=state, payload=recalculated, stale_fields=stale)
+            return result
+        result["action"] = "unchanged"
+        return result
+
+    @staticmethod
+    def _recompute_facts(payload: Dict[str, Any], fact: Dict[str, Any]) -> Dict[str, Any]:
+        p = dict(payload)
+        p.update(fact)
+        received_day = int(p.get("received_day", 0))
+        deadline_days = int(p.get("deadline_days", 1))
+        p["deadline_day"] = received_day + deadline_days
+        p["days_remaining"] = p["deadline_day"] - int(p.get("response_day", 0))
+        p["overdue"] = p["days_remaining"] < 0
+        required = list(p.get("required_documents", []))
+        p["required_documents"] = required
+        p["missing_documents"] = [
+            doc for doc in required if doc not in p.get("submitted_documents", [])
+        ]
+        p.pop("invalidated_basis_batch_version", None)
+        return p
+
+    def validate_receipt(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        r = dict(data or {})
+        text(r, "receipt_no")
+        r["documents"] = text_list(r, "documents", 1)
+        r["note"] = str(r.get("note", "") or "")
+        return r
+
+    @staticmethod
+    def receipt_diff(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+        return {key: value for key, value in new.items() if old.get(key) != value}
