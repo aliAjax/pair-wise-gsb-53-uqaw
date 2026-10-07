@@ -33,6 +33,45 @@ class Service:
         self.rules.check_create_conflicts(prepared, self.repository.list_records(limit=500))
         return self.repository.create(reference, self.rules.INITIAL_STATE, prepared, actor.user_id)
 
+    def create_batch(self, actor: Actor, payload: Dict[str, Any]) -> Dict[str, Any]:
+        actor = self._actor(actor)
+        self._ensure_known_role(actor)
+        if not self.rules.role_can_save_batch(actor.role):
+            raise PermissionDenied("角色无权保存批次")
+        save_token = text(payload or {}, "save_token")
+        committed = self.repository.get_committed_save_token(save_token)
+        if committed is not None:
+            return committed
+        plan = self.rules.prepare_batch_plan({}, payload or {}, actor.user_id, create=True)
+        return self.repository.create_batch(plan)
+
+    def save_batch(self, actor: Actor, batch_no: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        actor = self._actor(actor)
+        self._ensure_known_role(actor)
+        if not self.rules.role_can_save_batch(actor.role):
+            raise PermissionDenied("角色无权保存批次")
+        batch_no = text({"batch_no": batch_no}, "batch_no")
+        save_token = text(payload or {}, "save_token")
+        committed = self.repository.get_committed_save(batch_no, save_token)
+        if committed is not None:
+            committed["batch_no"] = batch_no
+            return committed
+        snapshot = self.repository.get_batch_by_no(batch_no)
+        plan = self.rules.prepare_batch_plan(snapshot, payload or {}, actor.user_id, create=False)
+        result = self.repository.save_batch(batch_no, plan)
+        result["batch_no"] = batch_no
+        return result
+
+    def get_batch(self, actor: Actor, batch_no: str) -> Dict[str, Any]:
+        actor = self._actor(actor)
+        self._ensure_known_role(actor)
+        return self.repository.get_batch_by_no(batch_no)
+
+    def batch_timeline(self, actor: Actor, batch_no: str) -> List[Dict[str, Any]]:
+        actor = self._actor(actor)
+        self._ensure_known_role(actor)
+        return self.repository.batch_timeline(batch_no)
+
     def list_records(self, actor: Actor, state: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
         actor = self._actor(actor)
         self._ensure_known_role(actor)

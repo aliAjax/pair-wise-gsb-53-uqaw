@@ -3,8 +3,8 @@ import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict
-from urllib.parse import parse_qs, urlparse
+from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .domain import Actor, DomainError, PermissionDenied, ValidationError
 
@@ -12,6 +12,9 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+BATCH_RE = re.compile(r"^/api/batches/([^/]+)$")
+BATCH_SAVE_RE = re.compile(r"^/api/batches/([^/]+)/save$")
+BATCH_AUDIT_RE = re.compile(r"^/api/batches/([^/]+)/audit$")
 
 
 def make_handler(service: Any, static_dir: Path):
@@ -28,12 +31,12 @@ def make_handler(service: Any, static_dir: Path):
                 raise PermissionDenied("缺少X-User-Id或X-Role")
             return Actor(user_id=user_id, role=role, organization=self.headers.get("X-Org", ""))
 
-        def _body(self) -> Dict[str, Any]:
+        def _body(self) -> dict:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError as exc:
                 raise ValidationError("Content-Length无效") from exc
-            if length > 1024 * 1024:
+            if length > 4 * 1024 * 1024:
                 raise ValidationError("请求体过大")
             raw = self.rfile.read(length) if length else b"{}"
             try:
@@ -57,7 +60,10 @@ def make_handler(service: Any, static_dir: Path):
 
         def _handle_error(self, exc: Exception) -> None:
             if isinstance(exc, DomainError):
-                self._send(exc.status, {"error": exc.code, "message": str(exc)})
+                payload: Any = {"error": exc.code, "message": str(exc)}
+                if getattr(exc, "details", None):
+                    payload["details"] = exc.details
+                self._send(exc.status, payload)
             else:
                 self._send(500, {"error": "internal_error", "message": "服务内部错误"})
 
@@ -84,6 +90,14 @@ def make_handler(service: Any, static_dir: Path):
                 if match:
                     self._send(200, {"items": service.timeline(self._actor(), int(match.group(1)))})
                     return
+                match = BATCH_RE.match(parsed.path)
+                if match:
+                    self._send(200, service.get_batch(self._actor(), unquote(match.group(1))))
+                    return
+                match = BATCH_AUDIT_RE.match(parsed.path)
+                if match:
+                    self._send(200, {"items": service.batch_timeline(self._actor(), unquote(match.group(1)))})
+                    return
                 if parsed.path == "/api/stats":
                     self._send(200, service.stats(self._actor()))
                     return
@@ -98,6 +112,15 @@ def make_handler(service: Any, static_dir: Path):
                 if parsed.path == "/api/records":
                     record = service.create(self._actor(), body.get("reference", ""), body.get("data", {}))
                     self._send(201, record)
+                    return
+                if parsed.path == "/api/batches":
+                    batch = service.create_batch(self._actor(), body)
+                    self._send(201, batch)
+                    return
+                match = BATCH_SAVE_RE.match(parsed.path)
+                if match:
+                    batch = service.save_batch(self._actor(), unquote(match.group(1)), body)
+                    self._send(200, batch)
                     return
                 match = ACTION_RE.match(parsed.path)
                 if match:
